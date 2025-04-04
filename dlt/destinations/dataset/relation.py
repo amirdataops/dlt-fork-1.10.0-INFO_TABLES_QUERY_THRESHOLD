@@ -1,20 +1,19 @@
-from typing import Any, Generator, Sequence, Union, TYPE_CHECKING
-
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Generator, Sequence, Union
 
 
-from dlt.common.destination.dataset import (
-    SupportsReadableRelation,
-)
-
+from dlt.common.schema import Schema
+from dlt.common.schema.typing import TTableSchemaColumns, C_DLT_LOAD_ID
+from dlt.common.schema.utils import is_nested_table
+from dlt.destinations.sql_client import SqlClientBase
 from dlt.destinations.dataset.exceptions import (
     ReadableRelationHasQueryException,
     ReadableRelationUnknownColumnException,
 )
+from dlt.common.destination.dataset import (
+    SupportsReadableRelation,
+)
 
-from dlt.common.schema.typing import TTableSchemaColumns
-from dlt.destinations.sql_client import SqlClientBase
-from dlt.common.schema import Schema
 
 if TYPE_CHECKING:
     from dlt.destinations.dataset.dataset import ReadableDBAPIDataset
@@ -124,6 +123,19 @@ class ReadableDBAPIRelation(BaseReadableDBAPIRelation):
             self.schema.naming.normalize_path(self._table_name)
         )
 
+        maybe_where_clause = ""
+        if self._dataset._load_ids:
+            if is_nested_table(self.schema.tables[self._table_name]):
+                raise RuntimeError(
+                    "ReadableDBAPIRelation only supports incremental filtering for root tables. "
+                    "Use the Ibis dataset_type with `dlt.pipeline(...).dataset(dataset_type='ibis') "
+                    "to filter nested tables with root_key."
+                )
+
+            normalized_load_id_col = self.schema.naming.normalize_table_identifier(C_DLT_LOAD_ID)
+            maybe_where_clause += f"WHERE {normalized_load_id_col} IN {list(self._dataset._load_ids)}"
+            # TODO handle non-root tables
+
         maybe_limit_clause_1 = ""
         maybe_limit_clause_2 = ""
         if self._limit:
@@ -140,7 +152,7 @@ class ReadableDBAPIRelation(BaseReadableDBAPIRelation):
                 ]
             )
 
-        return f"SELECT {maybe_limit_clause_1} {selector} FROM {table_name} {maybe_limit_clause_2}"
+        return f"SELECT {maybe_limit_clause_1} {selector} FROM {table_name} {maybe_where_clause} {maybe_limit_clause_2}"
 
     @property
     def columns_schema(self) -> TTableSchemaColumns:
@@ -197,13 +209,23 @@ class ReadableDBAPIRelation(BaseReadableDBAPIRelation):
         rel.compute_columns_schema()
         return rel
 
-    def __getitem__(self, columns: Union[str, Sequence[str]]) -> "SupportsReadableRelation":
-        if isinstance(columns, str):
-            return self.select(columns)
-        elif isinstance(columns, Sequence):
-            return self.select(*columns)
+    def __getitem__(self, *columns: Union[str, Sequence[str]]) -> "SupportsReadableRelation":
+        """Supports: self["col1"], self["col1", "col2"], self[["col1", "col2"]]"""
+        # self["foo"]
+        if len(columns) == 1 and isinstance(columns[0], str):
+            return self.select(columns[0])
+        # NOTE `str` check needs to happen first because `issubclass(str, Sequence) is True`
+        # self[["foo"]] or self[["foo", "bar"]]
+        elif len(columns) == 1 and isinstance(columns[0], Sequence):
+            return self.select(*columns[0])
+        # self["foo", "bar"]
+        elif all(isinstance(col, str) for col in columns):
+            return self.select(*columns)  # type: ignore
         else:
-            raise TypeError(f"Invalid argument type: {type(columns).__name__}")
+            raise ValueError(
+                "ReadableDBAPIRelation can be accessed using `rel['foo']`, `rel['foo', 'bar']` and"
+                f" `rel[['foo', 'bar']]`.\nReceived: `{columns}`"
+            )
 
     def head(self, limit: int = 5) -> "ReadableDBAPIRelation":
         return self.limit(limit)

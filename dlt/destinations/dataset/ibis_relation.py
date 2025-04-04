@@ -1,10 +1,15 @@
-from typing import TYPE_CHECKING, Any, Union, Sequence
-
+from collections.abc import Sequence
 from functools import partial
+from typing import TYPE_CHECKING, Any, Optional, Union, Set
 
 from dlt.common.exceptions import MissingDependencyException
+from dlt.common.schema.utils import (
+    get_root_table,
+    get_first_column_name_with_prop,
+    is_nested_table,
+)
+from dlt.common.schema.typing import TTableSchemaColumns, C_DLT_LOAD_ID
 from dlt.destinations.dataset.relation import BaseReadableDBAPIRelation
-from dlt.common.schema.typing import TTableSchemaColumns
 
 if TYPE_CHECKING:
     from dlt.destinations.dataset.dataset import ReadableDBAPIDataset
@@ -12,9 +17,9 @@ else:
     ReadableDBAPIDataset = Any
 
 try:
-    from dlt.helpers.ibis import Expr
+    from dlt.helpers.ibis import Table
 except MissingDependencyException:
-    Expr = Any
+    Table = Any
 
 
 # NOTE: some dialects are not supported by ibis, but by sqlglot, these need to
@@ -32,17 +37,22 @@ class ReadableIbisRelation(BaseReadableDBAPIRelation):
         readable_dataset: ReadableDBAPIDataset,
         ibis_object: Any = None,
         columns_schema: TTableSchemaColumns = None,
+        table_name: str = None,
     ) -> None:
         """Create a lazy evaluated relation to for the dataset of a destination"""
         super().__init__(readable_dataset=readable_dataset)
         self._ibis_object = ibis_object
         self._columns_schema = columns_schema
+        self._table_name = table_name
 
     def query(self) -> Any:
         """build the query"""
         from dlt.helpers.ibis import ibis, sqlglot
 
         target_dialect = self._dataset._destination.capabilities().sqlglot_dialect
+
+        if self._dataset._load_ids:
+            self = self._filter_by_load_id(self._dataset._load_ids)
 
         # render sql directly if possible
         if target_dialect not in TRANSPILE_VIA_DEFAULT:
@@ -66,10 +76,45 @@ class ReadableIbisRelation(BaseReadableDBAPIRelation):
     def columns_schema(self, new_value: TTableSchemaColumns) -> None:
         raise NotImplementedError("columns schema in ReadableDBAPIRelation can only be computed")
 
+    @property
+    def table_name(self) -> str:
+        return self._table_name
+
     def compute_columns_schema(self) -> TTableSchemaColumns:
         """provide schema columns for the cursor, may be filtered by selected columns"""
         # TODO: provide column lineage tracing with sqlglot lineage
         return self._columns_schema
+    
+    def _filter_by_load_id(self, load_ids: Union[Sequence[str], Set[str]]) -> "ReadableIbisRelation":
+        load_ids = set(load_ids)
+        normalized_load_id_col = self.schema.naming.normalize_table_identifier(C_DLT_LOAD_ID)
+        table_schema = self.schema.tables[self.table_name]
+
+        # Case 1: current table is root
+        if not is_nested_table(table_schema):
+            return self.filter(self[normalized_load_id_col].isin(self._dataset._load_ids))
+        
+        root_key = get_first_column_name_with_prop(table_schema, column_prop="root_key")
+
+        # Unsupported case: current table is child/nested without a root_key set 
+        # TODO setup another case that traverse parent-row keys to join nested tables without root_key
+        if root_key is None:
+            raise KeyError(
+                "ReadableIbisRelation requires a `root_key` hint to join non-root tables. "
+                "Set `root_key=True` on the source or use `write_disposition='merge'`."
+            )
+        
+        # Case 2: current table is child/nested with a root_key to join with root_table
+        root_table_schema = get_root_table(self.schema.tables, self.table_name)
+        root_row_key: str = get_first_column_name_with_prop(
+            root_table_schema, column_prop="row_key"
+        )
+        root_table = self._dataset.table(root_table_schema["name"])
+        root_table = root_table.filter(root_table[normalized_load_id_col].isin(self._dataset._load_ids))
+        joined_table = self.inner_join(root_table, self[root_key] == root_table[root_row_key])
+        # `self` selects all columns from the original table
+        return joined_table.select(self, normalized_load_id_col)  # type: ignore
+
 
     def _proxy_expression_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
         """Proxy method calls to the underlying ibis expression, allowing to wrap the resulting expression in a new relation"""
@@ -133,15 +178,45 @@ class ReadableIbisRelation(BaseReadableDBAPIRelation):
 
         return partial(self._proxy_expression_method, name)
 
-    def __getitem__(self, columns: Union[str, Sequence[str]]) -> "ReadableIbisRelation":
-        # casefold column-names
-        columns = [columns] if isinstance(columns, str) else columns
-        columns = [self.sql_client.capabilities.casefold_identifier(col) for col in columns]
-        expr = self._ibis_object[columns]
+    def __getitem__(self, *columns: Union[str, Sequence[str]]) -> "ReadableIbisRelation":
+        """Proxy method to select columns on an Ibis expression.
+
+        This supports 3 notations:
+        ```
+        self["foo"]  # Column type
+        self["foo", "bar"]  # Table type
+        self[["foo", "bar"]]  # Table type
+        ```
+        Ibis reference: https://ibis-project.org/tutorials/ibis-for-pandas-users#selecting-columns
+        """
+        # self["foo"]
+        if len(columns) == 1 and isinstance(columns[0], str):
+            col = self.sql_client.capabilities.casefold_identifier(columns[0])
+            cols = [col]
+            expr = self._ibis_object[col]
+
+        # NOTE `str` check needs to happen first because `issubclass(str, Sequence) is True`
+        # self[["foo"]] or self[["foo", "bar"]]
+        elif len(columns) == 1 and isinstance(columns[0], Sequence):
+            cols = [self.sql_client.capabilities.casefold_identifier(col) for col in columns[0]]
+            expr = self._ibis_object[cols]
+
+        # self["foo", "bar"]
+        elif all(isinstance(col, str) for col in columns):
+            cols = [self.sql_client.capabilities.casefold_identifier(col) for col in columns]  # type: ignore
+            expr = self._ibis_object[cols]
+
+        else:
+            raise ValueError(
+                "ReadableIbisRelation can be accessed using `rel['foo']` to retrieve a column, or"
+                " `rel['foo', 'bar']` and `rel[['foo', 'bar']]` to access a table.\n"
+                f"Received: `{columns}`"
+            )
+
         return self.__class__(
             readable_dataset=self._dataset,
             ibis_object=expr,
-            columns_schema=self._get_filtered_columns_schema(columns),
+            columns_schema=self._get_filtered_columns_schema(cols),
         )
 
     def _get_filtered_columns_schema(self, columns: Sequence[str]) -> TTableSchemaColumns:

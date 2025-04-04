@@ -737,6 +737,10 @@ def transpose_rows_to_columns(
             "dlt pyarrow helpers", ["numpy"], "Numpy is required for this pyarrow operation"
         )
 
+    # exit early if rows are empty; otherwise, `np.vsplit` will raise ZeroDivisionError: integer modulo by zero
+    if len(rows) == 0:
+        return {column_name: np.array([]) for column_name in column_names}
+
     try:
         from pandas._libs import lib
 

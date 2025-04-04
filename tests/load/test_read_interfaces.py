@@ -1,33 +1,38 @@
-from typing import Any, cast, Tuple, List
-import re
-import pytest
-import dlt
 import os
+import re
+from functools import reduce
+from typing import TYPE_CHECKING, Any, cast, Tuple, List
 
+import pytest
+
+import dlt
 from dlt import Pipeline
 from dlt.common import Decimal
-
-from typing import List
-from functools import reduce
-
 from dlt.common.schema.schema import Schema
+from dlt.common.schema.typing import C_DLT_LOAD_ID
 from dlt.common.storages.exceptions import SchemaNotFoundError
 from dlt.common.storages.file_storage import FileStorage
+from dlt.destinations import filesystem
+from dlt.destinations.dataset import dataset as _dataset
+from dlt.destinations.dataset.ibis_relation import ReadableIbisRelation
+from dlt.destinations.dataset.dataset import ReadableDBAPIDataset
+from dlt.destinations.dataset.exceptions import ReadableRelationUnknownColumnException
+
+from tests.utils import TEST_STORAGE_ROOT, clean_test_storage
 from tests.load.utils import (
     destinations_configs,
     DestinationTestConfiguration,
+    drop_pipeline_data,
     GCS_BUCKET,
     SFTP_BUCKET,
     MEMORY_BUCKET,
 )
-from dlt.destinations import filesystem
-from tests.utils import TEST_STORAGE_ROOT, clean_test_storage
-from dlt.destinations.dataset.dataset import ReadableDBAPIDataset
-from dlt.destinations.dataset.exceptions import (
-    ReadableRelationUnknownColumnException,
-)
-from tests.load.utils import drop_pipeline_data
-from dlt.destinations.dataset import dataset as _dataset
+
+if TYPE_CHECKING:
+    from dlt.common.libs import pandas as pd
+else:
+    pd = Any
+
 
 EXPECTED_COLUMNS = ["id", "decimal", "other_decimal", "_dlt_load_id", "_dlt_id"]
 
@@ -81,7 +86,7 @@ def populated_pipeline(request, autouse_test_storage) -> Any:
     os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "700"
     total_records = _total_records(pipeline)
 
-    @dlt.source()
+    @dlt.source(root_key=True)
     def source():
         @dlt.resource(
             table_format=destination_config.table_format,
@@ -133,6 +138,111 @@ def populated_pipeline(request, autouse_test_storage) -> Any:
     # NOTE: "aleph" schema is now the newest schema in the dataset and we assume that later in the tests
     # TODO: we need some kind of idea for multi-schema datasets
     pipeline.run([1, 2, 3], table_name="digits", schema=Schema("aleph"))
+
+    # in case of delta on gcs we use the s3 compat layer for reading
+    # for writing we still need to use the gc authentication, as delta_rs seems to use
+    # methods on the s3 interface that are not implemented by gcs
+    if destination_config.bucket_url == GCS_BUCKET and destination_config.table_format == "delta":
+        gcp_bucket = filesystem(
+            GCS_BUCKET.replace("gs://", "s3://"), destination_name="filesystem_s3_gcs_comp"
+        )
+        access_pipeline = destination_config.setup_pipeline(
+            "read_pipeline", dataset_name="read_test", destination=gcp_bucket
+        )
+
+        pipeline.destination = access_pipeline.destination
+
+    # return pipeline to test
+    yield pipeline
+
+    # NOTE: we need to drop pipeline data here since we are keeping the pipelines around for the whole module
+    drop_pipeline_data(pipeline)
+
+
+# TODO move `destination_config` to it's own fixture
+# TODO move source function to top-level
+@pytest.fixture(scope="session")
+def pipeline_with_multiple_loads(request, autouse_test_storage) -> Any:
+    """fixture that returns a pipeline object populated with the example data"""
+
+    destination_config = cast(DestinationTestConfiguration, request.param)
+
+    if (
+        destination_config.file_format not in ["parquet", "jsonl"]
+        and destination_config.destination_type == "filesystem"
+    ):
+        pytest.skip(
+            "Test only works for jsonl and parquet on filesystem destination, given:"
+            f" {destination_config.file_format}"
+        )
+
+    pipeline = destination_config.setup_pipeline(
+        "read_pipeline", dataset_name="read_test", dev_mode=True
+    )
+    os.environ["DATA_WRITER__FILE_MAX_ITEMS"] = "700"
+    total_records = _total_records(pipeline)
+
+    @dlt.source(root_key=True)
+    def source(expected_load_id):
+        @dlt.resource(
+            table_format=destination_config.table_format,
+            write_disposition="replace",
+            columns={
+                "id": {"data_type": "bigint"},
+                "expected_load_id": {"data_type": "bigint"},
+                # we add a decimal with precision to see wether the hints are preserved
+                "decimal": {"data_type": "decimal", "precision": 10, "scale": 3},
+                "other_decimal": {"data_type": "decimal", "precision": 12, "scale": 3},
+            },
+        )
+        def items():
+            for i in range(total_records):
+                yield {
+                    "id": i,
+                    "expected_load_id": expected_load_id,
+                    "children": [{"id": i + 100}, {"id": i + 1000}],
+                    "decimal": Decimal("10.433"),
+                    "other_decimal": Decimal("10.433"),
+                }
+
+        @dlt.resource(
+            table_format=destination_config.table_format,
+            write_disposition="replace",
+            columns={
+                "id": {"data_type": "bigint"},
+                "expected_load_id": {"data_type": "bigint"},
+                "double_id": {"data_type": "bigint"},
+                "di_decimal": {"data_type": "decimal", "precision": 7, "scale": 3},
+            },
+        )
+        def double_items():
+            for i in range(total_records):
+                if expected_load_id ==1 and i > (total_records / 2):
+                    raise RuntimeError("This mocks a runtime error that leads to a failed job.")
+
+                yield {                 
+                    "id": i,
+                    "expected_load_id": expected_load_id,
+                    "double_id": i * 2,
+                    "di_decimal": Decimal("10.433"),
+                }
+
+        return [items, double_items]
+
+    # run source
+    pipeline.run(
+        source(0), loader_file_format=destination_config.file_format, write_disposition="append"
+    )
+    # execute a pipeline run and mock a failed execution
+    try:
+        pipeline.run(
+            source(1), loader_file_format=destination_config.file_format, write_disposition="append"
+        )
+    except Exception:
+        pass
+    pipeline.run(
+        source(2), loader_file_format=destination_config.file_format, write_disposition="append"
+    )
 
     # in case of delta on gcs we use the s3 compat layer for reading
     # for writing we still need to use the gc authentication, as delta_rs seems to use
@@ -415,6 +525,112 @@ def test_row_counts(populated_pipeline: Pipeline) -> None:
         ),
     }
 
+# TODO remove per-destination parameterization for many tests in this file.
+# If they focus on ReadableDBAPIDataset and don't load data, they're unlikely to need parameterization
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "populated_pipeline",
+    [c for c in configs if c[0][0].destination_type == "duckdb"],
+    indirect=True,
+    ids=lambda x: x.name,
+)
+def test_filter(populated_pipeline: Pipeline) -> None:
+    mock_load_ids = ["foo1", "bar2"]
+    dataset = populated_pipeline.dataset()
+    dataset_filtered_at_init = populated_pipeline.dataset(load_ids=mock_load_ids)
+
+    assert dataset._load_ids == set()
+    assert dataset_filtered_at_init._load_ids == set(mock_load_ids)
+    assert type(dataset) is type(dataset_filtered_at_init)
+
+    dataset_filtered_later = dataset.filter(mock_load_ids)
+
+    # ensure `dataset` wasn't mutated
+    assert dataset._load_ids == set()
+    assert dataset_filtered_later._load_ids == set(mock_load_ids)
+    assert type(dataset) is type(dataset_filtered_later)  
+
+    # chain filters
+    other_load_ids = ["baz3"]
+    dataset_filtered_twice = dataset.filter(mock_load_ids).filter(other_load_ids)
+    assert dataset_filtered_twice._load_ids == set(mock_load_ids + other_load_ids)
+
+
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "pipeline_with_multiple_loads",
+    configs,
+    indirect=True,
+    ids=lambda x: x.name,
+)
+def test_list_load_ids(pipeline_with_multiple_loads: Pipeline) -> None:
+    successful_load_ids = pipeline_with_multiple_loads.list_completed_load_packages()
+    # test includes 2 success and 1 failed load
+    assert len(successful_load_ids) == 2
+    dataset: ReadableDBAPIDataset = pipeline_with_multiple_loads.dataset()
+
+    retrieved_load_ids = dataset.list_load_ids()
+    # only accepts keyword arguments
+    with pytest.raises(TypeError):
+        dataset.list_load_ids(1)
+
+    assert isinstance(retrieved_load_ids, tuple)
+    assert all(isinstance(load_id, str) for load_id in retrieved_load_ids)
+    assert set(retrieved_load_ids) == set(successful_load_ids)
+    assert retrieved_load_ids == tuple(sorted(successful_load_ids, reverse=True))
+
+    # check status kwarg
+    # status=0 is currently "success" and should match status=None when there's no failure
+    assert dataset.list_load_ids(status=0) == retrieved_load_ids
+    assert len(dataset.list_load_ids(status=0)) == len(successful_load_ids)
+    # status=1 is currently an invalid value and should never match rows
+    assert len(dataset.list_load_ids(status=1)) == 0
+    assert len(dataset.list_load_ids(status=[0])) == len(successful_load_ids)
+    assert len(dataset.list_load_ids(status=[0, 1])) == len(successful_load_ids)
+    assert len(dataset.list_load_ids(status=[1, 2])) == 0
+
+    # check limit kwarg
+    assert dataset.list_load_ids(limit=0) == tuple()
+    assert len(dataset.list_load_ids(limit=2)) == 2
+    assert len(dataset.list_load_ids(limit=5)) == len(successful_load_ids)
+    # sorting should happen before limit; i.e., limit=1 returns the max value
+    assert dataset.list_load_ids(limit=1)[0] == max(successful_load_ids)
+
+
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "pipeline_with_multiple_loads",
+    configs,
+    indirect=True,
+    ids=lambda x: x.name,
+)
+def test_latest_load_id(pipeline_with_multiple_loads: Pipeline) -> None:
+    successful_load_ids = pipeline_with_multiple_loads.list_completed_load_packages()
+    # test includes 2 success and 1 failed load
+    assert len(successful_load_ids) == 2
+    dataset: ReadableDBAPIDataset = pipeline_with_multiple_loads.dataset()
+
+    latest_load_id = dataset.latest_load_id()
+    # only accepts keyword arguments
+    with pytest.raises(TypeError):
+        dataset.list_load_ids(1)
+
+    assert isinstance(latest_load_id, str)
+    assert latest_load_id == max(successful_load_ids)
+
+    # check status kwarg
+    # status=0 is currently "success" and should match status=None when there's no failure
+    assert dataset.latest_load_id(status=0) == latest_load_id
+    # status=1 is currently an invalid value and should never match rows
+    assert dataset.latest_load_id(status=1) is None
+    assert dataset.latest_load_id(status=1) is None
+    assert dataset.latest_load_id(status=[0]) == latest_load_id
+    assert dataset.latest_load_id(status=[0, 1]) == latest_load_id
+    assert dataset.latest_load_id(status=[1, 2]) is None
+
 
 @pytest.mark.no_load
 @pytest.mark.essential
@@ -532,6 +748,99 @@ def test_schema_arg(populated_pipeline: Pipeline) -> None:
     assert dataset.schema.name == "aleph"
     assert "digits" in dataset.schema.tables
     dataset.digits.fetchall()
+
+
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "pipeline_with_multiple_loads",
+    configs,
+    indirect=True,
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("dataset_type", ("ibis", ))#"default"))
+def test_dataset_methods_inherit_dataset_filter(pipeline_with_multiple_loads: Pipeline, dataset_type: str) -> None:
+    """ReadableDBAPIDataset.__call__() creates a ReadableDBAPIRelation with a pre-generated
+    SQL query. This allows dataset methods (e.g., `.row_counts()`) to inherit the filter.
+    """
+    successful_load_ids = pipeline_with_multiple_loads.list_completed_load_packages()
+    # test includes 2 success and 1 failed load
+    assert len(successful_load_ids) == 2
+    selected_load_id = successful_load_ids[0]
+    dataset: ReadableDBAPIDataset = pipeline_with_multiple_loads.dataset(dataset_type=dataset_type)
+    dataset_filtered = dataset.filter([selected_load_id])
+
+    # .list_load_ids()
+    assert set(dataset.list_load_ids()) == set(successful_load_ids)
+    assert set(dataset_filtered.list_load_ids()) ==  set([selected_load_id])
+
+    # .latest_load_id()
+    assert dataset_filtered.latest_load_id() == selected_load_id != dataset.latest_load_id()
+    
+    # .row_counts()
+    rows_per_table = {table_name: row_count for table_name, row_count in dataset.row_counts().fetchall()}
+    rows_per_table_filtered = {table_name: row_count for table_name, row_count in dataset_filtered.row_counts().fetchall()}
+    assert rows_per_table == rows_per_table_filtered
+
+
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "pipeline_with_multiple_loads",
+    configs,
+    indirect=True,
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("dataset_type", ("ibis", "default"))
+def test_filter_root_table(pipeline_with_multiple_loads: Pipeline, dataset_type: str) -> None:
+    successful_load_ids = pipeline_with_multiple_loads.list_completed_load_packages()
+    # test includes 2 success and 1 failed load
+    assert len(successful_load_ids) == 2
+    selected_load_id = successful_load_ids[0]
+    dataset: ReadableDBAPIDataset = pipeline_with_multiple_loads.dataset(dataset_type=dataset_type)
+    dataset_filtered = dataset.filter([selected_load_id])
+    normalized_load_id_col = dataset.schema.naming.normalize_table_identifier(C_DLT_LOAD_ID)
+
+    items_df: pd.DataFrame = dataset.items.df()
+    items_df_filtered: pd.DataFrame = dataset_filtered.items.df()
+
+    assert items_df.shape[0] > items_df_filtered.shape[0]
+    assert set(successful_load_ids) != set([selected_load_id])
+    assert set(items_df[normalized_load_id_col].unique()) == set(successful_load_ids)
+    assert set(items_df_filtered[normalized_load_id_col].unique()) == set([selected_load_id])
+
+
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "pipeline_with_multiple_loads",
+    configs,
+    indirect=True,
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("dataset_type", ("ibis", "default"))
+def test_filter_non_root_table_with_row_key(pipeline_with_multiple_loads: Pipeline, dataset_type: str) -> None:
+    successful_load_ids = pipeline_with_multiple_loads.list_completed_load_packages()
+    # test includes 2 success and 1 failed load
+    assert len(successful_load_ids) == 2
+    selected_load_id = successful_load_ids[0]
+    dataset: ReadableDBAPIDataset = pipeline_with_multiple_loads.dataset(dataset_type=dataset_type)
+    dataset_filtered = dataset.filter([selected_load_id])
+    normalized_load_id_col = dataset.schema.naming.normalize_table_identifier(C_DLT_LOAD_ID)
+
+    nested_df: pd.DataFrame = dataset.items__children.df()
+
+    if dataset_type == "ibis":
+        nested_df_filtered: pd.DataFrame = dataset_filtered.items__children.df()
+        # by default, non-root tables don't have a `_dlt_load_id` column
+        assert normalized_load_id_col not in nested_df.columns
+        assert normalized_load_id_col in nested_df_filtered.columns
+        assert nested_df.shape[0] > nested_df_filtered.shape[0]
+        assert set(successful_load_ids) != set([selected_load_id])
+        assert set(nested_df_filtered[normalized_load_id_col].unique()) == set([selected_load_id])
+    else:
+        with pytest.raises(RuntimeError):
+            nested_df_filtered: pd.DataFrame = dataset_filtered.items__children.df()
 
 
 @pytest.mark.no_load
@@ -799,6 +1108,30 @@ def test_ibis_dataset_access(populated_pipeline: Pipeline) -> None:
     items_table = ibis_connection.table(add_table_prefix(map_i("items")), database=dataset_name)
     assert items_table.count().to_pandas() == total_records
     ibis_connection.disconnect()
+
+
+@pytest.mark.no_load
+@pytest.mark.essential
+@pytest.mark.parametrize(
+    "populated_pipeline",
+    configs,
+    indirect=True,
+    ids=lambda x: x.name,
+)
+def test_ibis_column_selection(populated_pipeline: Pipeline) -> None:
+    import ibis.expr.types as ir  # type: ignore
+
+    rel = populated_pipeline.dataset(dataset_type="ibis").items
+
+    table_expr = [rel[["id"]], rel["id", "decimal"], rel[["id", "decimal"]]]
+    for t in table_expr:
+        assert isinstance(t, ReadableIbisRelation)
+        assert isinstance(t._ibis_object, ir.Table)
+
+    col_expr = [rel.id, rel["id"]]
+    for c in col_expr:
+        assert isinstance(c, ReadableIbisRelation)
+        assert isinstance(c._ibis_object, ir.Column)
 
 
 @pytest.mark.no_load
