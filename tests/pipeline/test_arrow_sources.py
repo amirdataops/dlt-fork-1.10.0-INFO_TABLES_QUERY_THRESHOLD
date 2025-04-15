@@ -635,7 +635,7 @@ def test_replace_existing_dlt_load_id():
         yield table
 
     pipeline.extract(some_data())
-    pipeline.normalize(loader_file_format="parquet")
+    pipeline.normalize()
 
     # Retrieve the normalized table
     load_id = pipeline.list_normalized_load_packages()[0]
